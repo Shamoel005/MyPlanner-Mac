@@ -241,6 +241,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        setupMainMenu()
         focus.logger = { [weak self] subject, minutes in
             self?.study.data.sessions.insert(Session(id: nowMs(), subject: subject, minutes: minutes, date: nowMs()), at: 0)
         }
@@ -273,6 +274,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try? SMAppService.mainApp.register()
         }
         setupStatusItem()
+    }
+
+    /// A hidden main menu is what makes Cmd+C, Cmd+V, Cmd+Z and Cmd+A work inside text fields.
+    func setupMainMenu() {
+        let main = NSMenu()
+        let appItem = NSMenuItem()
+        main.addItem(appItem)
+        let appMenu = NSMenu()
+        appItem.submenu = appMenu
+        appMenu.addItem(withTitle: "Quit My Planner", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let editItem = NSMenuItem()
+        main.addItem(editItem)
+        let edit = NSMenu(title: "Edit")
+        editItem.submenu = edit
+        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        let redo = edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        NSApp.mainMenu = main
     }
 
     func setupStatusItem() {
@@ -1086,17 +1110,32 @@ struct HabitRow: View {
     }
 }
 
-// MARK: - Notes (list + full page editor with add/delete lines)
+// MARK: - Notes (list + full-page editor)
+
+func wordCount(_ s: String) -> Int { s.split { $0.isWhitespace || $0.isNewline }.count }
 
 struct NotesView: View {
     @EnvironmentObject var store: Store
     @Binding var openNote: Int64?
+    @State private var q = ""
+
     var body: some View {
         if let id = openNote, store.items.contains(where: { $0.id == id }) {
             NoteDetail(id: id) { openNote = nil }
         } else {
-            let list = store.items.filter { $0.kind == "note" }.sorted { $0.pinned && !$1.pinned }
+            let list = store.items.filter { n in
+                n.kind == "note" && (q.isEmpty || n.title.localizedCaseInsensitiveContains(q) || n.body.localizedCaseInsensitiveContains(q))
+            }.sorted { a, b in
+                if a.pinned != b.pinned { return a.pinned }
+                return max(a.doneAt, a.id) > max(b.doneAt, b.id)
+            }
             Page {
+                FieldBox {
+                    HStack {
+                        Image(systemName: "magnifyingglass").foregroundStyle(Color.secondary)
+                        TextField("Search notes", text: $q)
+                    }
+                }
                 if list.isEmpty { EmptyHint("Type a title below to start a note.\nClick a note to open it as a full page.") }
                 ForEach(list) { n in
                     Button { openNote = n.id } label: {
@@ -1108,15 +1147,13 @@ struct NotesView: View {
                                     if n.pinned { Image(systemName: "pin.fill").font(.system(size: 10)).foregroundStyle(Color.orange) }
                                     Image(systemName: "chevron.right").font(.system(size: 10)).foregroundStyle(Color.secondary)
                                 }
-                                let lines = n.body.components(separatedBy: "\n").filter { !$0.isEmpty }
-                                if !lines.isEmpty {
-                                    Text(lines.prefix(3).joined(separator: "\n"))
-                                        .font(.system(size: 12)).foregroundStyle(Color.secondary).lineLimit(3)
-                                        .multilineTextAlignment(.leading)
-                                    if lines.count > 3 {
-                                        Text("+ \(lines.count - 3) more lines").font(.system(size: 10.5)).foregroundStyle(Color.secondary.opacity(0.8))
-                                    }
+                                if !n.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                    Text(n.body.trimmingCharacters(in: .whitespacesAndNewlines))
+                                        .font(.system(size: 12)).foregroundStyle(Color.secondary)
+                                        .lineLimit(3).multilineTextAlignment(.leading)
                                 }
+                                Text("\(wordCount(n.body)) words · " + fmt("d MMM, h:mm a", dateOf(max(n.doneAt, n.id))))
+                                    .font(.system(size: 10)).foregroundStyle(Color.secondary.opacity(0.8))
                             }
                         }
                     }
@@ -1132,101 +1169,134 @@ struct NoteDetail: View {
     @Environment(\.tintC) var tintC
     let id: Int64
     var close: () -> Void
-    @FocusState private var focused: Int?
+    @State private var confirmDelete = false
+    @State private var flash = ""
 
     var note: Item? { store.items.first { $0.id == id } }
 
-    func lines() -> [String] {
-        guard let n = note, !n.body.isEmpty else { return [""] }
-        return n.body.components(separatedBy: "\n")
-    }
-
-    func setLines(_ l: [String]) {
-        let safe = l.isEmpty ? [""] : l
-        store.update(id) { $0.body = safe.joined(separator: "\n") }
-    }
-
-    func lineBinding(_ i: Int) -> Binding<String> {
+    func bodyBinding() -> Binding<String> {
         Binding(
-            get: { let l = lines(); return i < l.count ? l[i] : "" },
-            set: { v in var l = lines(); if i < l.count { l[i] = v.replacingOccurrences(of: "\n", with: " "); setLines(l) } }
+            get: { note?.body ?? "" },
+            set: { v in store.update(id) { $0.body = v; $0.doneAt = nowMs() } }
         )
     }
 
-    func insertLine(after i: Int) {
-        var l = lines()
-        l.insert("", at: min(i + 1, l.count))
-        setLines(l)
-        DispatchQueue.main.async { focused = i + 1 }
+    func titleBinding() -> Binding<String> {
+        Binding(
+            get: { note?.title ?? "" },
+            set: { v in store.update(id) { $0.title = v; $0.doneAt = nowMs() } }
+        )
     }
 
-    func deleteLine(_ i: Int) {
-        var l = lines()
-        guard i < l.count else { return }
-        l.remove(at: i)
-        setLines(l)
+    func append(_ text: String) {
+        store.update(id) { n in
+            var b = n.body
+            if !b.isEmpty && !b.hasSuffix("\n") { b += "\n" }
+            n.body = b + text
+            n.doneAt = nowMs()
+        }
+    }
+
+    func fullText(_ n: Item) -> String { n.title + "\n\n" + n.body }
+
+    func copyAll(_ n: Item) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(fullText(n), forType: .string)
+        flash = "Copied to clipboard"
+    }
+
+    func export(_ n: Item) {
+        NSApp.activate(ignoringOtherApps: true)
+        let p = NSSavePanel()
+        p.nameFieldStringValue = (n.title.isEmpty ? "note" : n.title) + ".txt"
+        p.allowedContentTypes = [.plainText]
+        if p.runModal() == .OK, let u = p.url {
+            try? fullText(n).write(to: u, atomically: true, encoding: .utf8)
+            flash = "Saved as a text file"
+        }
+    }
+
+    func tool(_ label: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(size: 11.5, weight: .medium))
+                .padding(.horizontal, 10).padding(.vertical, 5)
+                .background(Capsule().fill(Color.white.opacity(0.12)))
+        }
+        .buttonStyle(.plain)
     }
 
     var body: some View {
         if let n = note {
-            let l = lines()
-            VStack(spacing: 0) {
-                HStack {
+            let words = wordCount(n.body)
+            VStack(spacing: 8) {
+                HStack(spacing: 12) {
                     Button(action: close) {
                         HStack(spacing: 4) { Image(systemName: "chevron.left"); Text("Notes") }
                             .font(.system(size: 13, weight: .medium)).foregroundStyle(tintC)
                     }
                     .buttonStyle(.plain)
                     Spacer()
-                    Text("\(l.filter { !$0.isEmpty }.count) lines")
-                        .font(.system(size: 11)).foregroundStyle(Color.secondary)
                     Button { store.update(id) { $0.pinned.toggle() } } label: {
                         Image(systemName: n.pinned ? "pin.fill" : "pin").foregroundStyle(n.pinned ? Color.orange : Color.secondary)
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.plain).help("Pin to top")
+                    Button { copyAll(n) } label: { Image(systemName: "doc.on.doc").foregroundStyle(Color.secondary) }
+                        .buttonStyle(.plain).help("Copy the whole note")
+                    Button { export(n) } label: { Image(systemName: "square.and.arrow.up").foregroundStyle(Color.secondary) }
+                        .buttonStyle(.plain).help("Save as a text file")
                     Button {
-                        store.remove(id)
-                        close()
-                    } label: { Image(systemName: "trash").foregroundStyle(Color.red.opacity(0.85)) }
+                        if confirmDelete { store.remove(id); close() } else { confirmDelete = true }
+                    } label: {
+                        if confirmDelete {
+                            Text("Tap again to delete").font(.system(size: 11, weight: .semibold)).foregroundStyle(Color.red)
+                        } else {
+                            Image(systemName: "trash").foregroundStyle(Color.red.opacity(0.85))
+                        }
+                    }
                     .buttonStyle(.plain)
                 }
-                .padding(.horizontal, 18).padding(.vertical, 6)
+                .padding(.horizontal, 18).padding(.top, 4)
 
-                TextField("Title", text: Binding(get: { n.title }, set: { v in store.update(id) { $0.title = v } }))
+                TextField("Title", text: titleBinding())
                     .textFieldStyle(.plain)
                     .font(.system(size: 22, weight: .bold, design: .rounded))
-                    .padding(.horizontal, 18).padding(.bottom, 6)
+                    .padding(.horizontal, 18)
 
-                ScrollView {
-                    VStack(spacing: 4) {
-                        ForEach(Array(0..<l.count), id: \.self) { i in
-                            HStack(spacing: 8) {
-                                Text("\(i + 1)").font(.system(size: 10, design: .monospaced)).foregroundStyle(Color.secondary)
-                                    .frame(width: 22, alignment: .trailing)
-                                TextField("Write something…", text: lineBinding(i))
-                                    .textFieldStyle(.plain)
-                                    .font(.system(size: 13.5))
-                                    .focused($focused, equals: i)
-                                    .onSubmit { insertLine(after: i) }
-                                Button { deleteLine(i) } label: {
-                                    Image(systemName: "minus.circle").font(.system(size: 12)).foregroundStyle(Color.secondary.opacity(0.7))
-                                }
-                                .buttonStyle(.plain)
-                            }
-                            .padding(.horizontal, 10).padding(.vertical, 6)
-                            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.white.opacity(0.08)))
-                        }
-                        Button {
-                            insertLine(after: l.count - 1)
-                        } label: {
-                            HStack { Image(systemName: "plus.circle.fill"); Text("Add line") }
-                                .font(.system(size: 12.5, weight: .medium)).foregroundStyle(tintC)
-                                .frame(maxWidth: .infinity).padding(.vertical, 8)
-                        }
-                        .buttonStyle(.plain)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        tool("• Bullet") { append("• ") }
+                        tool("☐ Checkbox") { append("☐ ") }
+                        tool("☑ Done") { append("☑ ") }
+                        tool("— Divider") { append("——————————\n") }
+                        tool("📅 Today") { append(fmt("EEEE, d MMMM yyyy", Date()) + "\n") }
+                        tool("🕒 Time") { append(fmt("h:mm a", Date()) + " ") }
                     }
-                    .padding(.horizontal, 16).padding(.bottom, 16)
+                    .padding(.horizontal, 18)
                 }
+
+                TextEditor(text: bodyBinding())
+                    .font(.system(size: 14.5))
+                    .scrollContentBackground(.hidden)
+                    .padding(.horizontal, 10).padding(.vertical, 8)
+                    .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Color.white.opacity(0.09)))
+                    .overlay(alignment: .topLeading) {
+                        if n.body.isEmpty {
+                            Text("Start writing…")
+                                .font(.system(size: 14.5)).foregroundStyle(Color.secondary.opacity(0.7))
+                                .padding(.horizontal, 15).padding(.vertical, 16)
+                                .allowsHitTesting(false)
+                        }
+                    }
+                    .padding(.horizontal, 14)
+
+                HStack {
+                    Text("\(words) words · \(n.body.count) characters · ~\(max(1, words / 200)) min read")
+                    Spacer()
+                    Text(flash.isEmpty ? "Edited " + fmt("d MMM, h:mm a", dateOf(max(n.doneAt, n.id))) : flash)
+                }
+                .font(.system(size: 10.5)).foregroundStyle(Color.secondary)
+                .padding(.horizontal, 18).padding(.bottom, 12)
             }
         }
     }
